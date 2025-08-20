@@ -1,0 +1,55 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from datetime import datetime
+import requests, json, pandas as pd, lxml.etree as etree
+
+ISTAT_BASE_URL = "http://sdmx.istat.it/SDMXWS/rest"
+DATAFLOW_IDS = ["101_1033"]  # solo 1 dataset per non sovraccaricare la RAM
+
+def _discover_dataflow(ds_id, **ctx):
+    ti = ctx['ti']
+    url = f"{ISTAT_BASE_URL}/dataflow/IT1///{ds_id}?detail=full&references=none"
+    j = requests.get(url, headers={'Accept': 'application/json'}, timeout=30).json()
+    for ref in j.get('references', {}).values():
+        if ref.get('id') == ds_id:
+            struct = ref['structure']['urn'].split(':')[-1].replace(')', '').split('(')
+            ti.xcom_push(key='struct', value={'id': struct[0], 'ver': struct[1]})
+            return
+    raise ValueError("No structure found")
+
+def _download_codelists(ds_id, **ctx):
+    ti, pg = ctx['ti'], PostgresHook('postgres_istat')
+    struct = ti.xcom_pull(key='struct', task_ids=f'discover_{ds_id}')
+    if not struct: return
+    url = f"{ISTAT_BASE_URL}/datastructure/IT1/{struct['id']}/{struct['ver']}"
+    xml = requests.get(url, headers={'Accept': 'application/xml'}, timeout=30).content
+    root = etree.fromstring(xml)
+    ns = {'s':'http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure',
+          'c':'http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common'}
+    codelists = []
+    for ref in root.xpath('.//s:Ref[@class="Codelist"]', namespaces=ns):
+        cid = ref.get('id')
+        url_cl = f"{ISTAT_BASE_URL}/codelist/IT1/{cid}"
+        xml_cl = requests.get(url_cl, headers={'Accept': 'application/xml'}, timeout=30).content
+        root_cl = etree.fromstring(xml_cl)
+        name = root_cl.xpath('.//c:Name[@xml:lang="it"]/text()', namespaces=ns)[0]
+        for code in root_cl.xpath('.//s:Code', namespaces=ns):
+            codelists.append((cid, name, code.get('id'),
+                              code.xpath('.//c:Name[@xml:lang="it"]/text()', namespaces=ns)[0]))
+    pg.insert_rows(table='istat_codelists', rows=codelists,
+                   target_fields=['codelist_id','codelist_name','code_id','code_name'])
+
+def _download_dataset(ds_id, **ctx):
+    from istatapi.discovery import DataSet
+    from istatapi import retrieval
+    pg = PostgresHook('postgres_istat')
+    df = retrieval.get_data(DataSet(ds_id), filters={'startPeriod':'2020-01','endPeriod':'2020-12'})
+    df.to_sql(f'dataset_{ds_id.replace("-","_")}', pg.get_sqlalchemy_engine(), if_exists='replace', index=False)
+
+with DAG('dag_carlos', start_date=datetime(2023,1,1), schedule_interval=None, catchup=False) as dag:
+    for ds in DATAFLOW_IDS:
+        d = PythonOperator(task_id=f'discover_{ds}', python_callable=_discover_dataflow, op_args=[ds])
+        c = PythonOperator(task_id=f'codelists_{ds}', python_callable=_download_codelists, op_args=[ds])
+        p = PythonOperator(task_id=f'dataset_{ds}',  python_callable=_download_dataset,  op_args=[ds])
+        d >> c >> p

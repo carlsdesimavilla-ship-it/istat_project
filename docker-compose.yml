@@ -1,0 +1,93 @@
+version: '3.8'
+
+x-airflow-common: &airflow-common
+  build: .
+  image: my-istat-airflow-image:2.0
+  environment:
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres@postgres:5432/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://postgres:postgres@postgres:5432/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: 'BtUAzB_ZKZLJAAI6kYIMrCVMOXtNaHoHI6SeXIpSQ7c='
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow[postgres] istatapi pandas"
+  mem_limit: 3.8g          # 👈 ottimizzato per 4 GB fisici
+  user: "${AIRFLOW_UID:-50000}:0"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  depends_on:
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:13
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: airflow
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 5
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+  airflow-db-init:
+    <<: *airflow-common
+    command: ["airflow", "db", "init"]
+    depends_on:
+      - postgres
+      - redis
+    restart: "no"
+  airflow-create-user:
+    <<: *airflow-common
+    command: ["airflow", "users", "create", "--username", "admin", "--password", "admin", "--firstname", "Admin", "--lastname", "User", "--role", "Admin", "--email", "admin@example.com"]
+    depends_on:
+      airflow-db-init:
+        condition: service_completed_successfully
+    restart: "no"
+  airflow-webserver:
+    <<: *airflow-common
+    command: ["webserver"]
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-create-user:
+        condition: service_completed_successfully
+  airflow-scheduler:
+    <<: *airflow-common
+    command: ["scheduler"]
+    depends_on:
+      airflow-create-user:
+        condition: service_completed_successfully
+  airflow-worker:
+    <<: *airflow-common
+    command: ["celery", "worker"]
+    depends_on:
+      airflow-create-user:
+        condition: service_completed_successfully
+  airflow-triggerer:
+    <<: *airflow-common
+    command: ["triggerer"]
+    depends_on:
+      airflow-create-user:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
